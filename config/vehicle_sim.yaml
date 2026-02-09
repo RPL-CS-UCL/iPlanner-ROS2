@@ -1,0 +1,32 @@
+# iplanner_node parameter configuration
+iplanner_node:
+  ros__parameters:
+    main_freq: 15
+    image_flip: False
+    conv_dist: 0.25
+    is_sim: True
+    # network model
+    model_save: "/models/plannernet.pt"
+    crop_size: [360, 640]
+    uint_type: False
+    # images and goal waypoint topics
+    # UPDATED to match ROS 2 simulation standard names per implementation plan
+    depth_topic: "/camera/depth/image_raw" 
+    goal_topic: "/way_point"
+    path_topic: "/path"
+    image_topic: "/iplanner_image"
+    camera_tilt: 0.0
+    depth_max: 10.0
+    # frame ids
+    robot_id: "vehicle"  # vehicle_simulator uses 'vehicle' or sometimes 'camera' frame? Need to check. Defaulting to existing config.
+    world_id: "map"
+    # fear reaction
+    is_fear_act: True
+    buffer_size: 3
+    angular_thred: 0.5
+    track_dist: 0.5
+    # sensor offset
+    sensor_offset_x: 0.0
+    sensor_offset_y: 0.0
+    # smart joystick
+    joyGoal_scale: 5.0
