@@ -19,6 +19,12 @@ iPlanner is a deep learning-based path planner that generates local paths from d
 ## Installation
 
 1.  Clone specific branch (if applicable) or copy to your `src` folder.
+    > **Note**: This repository uses Git LFS for large model files. Ensure you have `git-lfs` installed:
+    > ```bash
+    > sudo apt-get install git-lfs
+    > git lfs install
+    > ```
+
 2.  Install dependencies:
     ```bash
     rosdep install --from-paths src --ignore-src -r -y
