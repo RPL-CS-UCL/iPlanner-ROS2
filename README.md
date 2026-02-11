@@ -36,6 +36,9 @@ iPlanner is a deep learning-based path planner that generates local paths from d
 
 ## Usage
 
+### 0. Download .pt file
+Download the pre-trained network weights `plannernet.pt` [here](https://drive.google.com/file/d/1UD11sSlOZlZhzij2gG_OmxbBN4WxVsO_/view?usp=share_link) and put it into the `models` folder. Noted this pre-trained network has not been adapted to real-world data.
+
 ### 1. Start Simulation
 First, launch the `vehicle_simulator` with the desired environment:
 ```bash
