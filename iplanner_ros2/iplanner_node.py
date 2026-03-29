@@ -14,7 +14,7 @@ import rclpy.duration
 import time
 from std_msgs.msg import Float32, Int16
 import numpy as np
-from sensor_msgs.msg import Image, Joy
+from sensor_msgs.msg import Image, Joy, CameraInfo
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, PointStamped, Point
 from cv_bridge import CvBridge
@@ -23,6 +23,12 @@ from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 # Use tf2_geometry_msgs to register geometry_msgs support
 import tf2_geometry_msgs
+
+try:
+    from . import traj_viz as traj_viz_module
+    _TRAJ_VIZ_AVAILABLE = True
+except Exception:  # open3d / pypose may not be installed
+    _TRAJ_VIZ_AVAILABLE = False
 
 # Add current directory to path so imports work if not installed as package
 # Though in ROS 2 ament_python, proper package structure is preferred.
@@ -75,6 +81,9 @@ class iPlannerNode(Node):
         parser.add_argument('joyGoal_scale',     type=float, default=0.5,                        help='Scale for joystick goal distance.')
         parser.add_argument('sensor_offset_x',   type=float, default=0.0,                        help='Sensor offset on the X-axis.')
         parser.add_argument('sensor_offset_y',   type=float, default=0.0,                        help='Sensor offset on the Y-axis.')
+        parser.add_argument('camera_tilt',        type=float, default=0.0,                        help='Camera tilt angle (rad) for image visualization.')
+        parser.add_argument('image_topic',        type=str,   default='/path_image',              help='Topic for iPlanner rendered image visualization.')
+        parser.add_argument('camera_info_topic',  type=str,   default='/camera/depth/camera_info',help='Topic for depth camera info (used to init visualizer).')
         
         args = parser.parse_args()
         
@@ -107,6 +116,12 @@ class iPlannerNode(Node):
         self.is_goal_init = False
         self.ready_for_planning = False
 
+        # visualization state
+        self.odom = None       # [1,7] SE3 tensor (set in imageCallback from TF)
+        self.traj_viz = None   # TrajViz instance (set in cameraInfoCallback)
+        self._viz_counter = 0
+        self._viz_interval = max(1, int(self.main_freq / 2))  # render at ~2Hz
+
         # planner status
         self.planner_status = Int16()
         self.planner_status.data = 0
@@ -119,7 +134,7 @@ class iPlannerNode(Node):
         # process time
         self.timer_data = Float32()
         
-        self.create_subscription(Image, self.image_topic, self.imageCallback, 10)
+        self.create_subscription(Image, self.depth_topic, self.imageCallback, 10)
         self.create_subscription(PointStamped, self.goal_topic, self.goalCallback, 10)
         self.create_subscription(Joy, "/joy", self.joyCallback, 10)
 
@@ -132,6 +147,10 @@ class iPlannerNode(Node):
 
         self.path_pub  = self.create_publisher(Path, self.path_topic, 10)
         self.fear_path_pub = self.create_publisher(Path, self.path_topic + "_fear", 10)
+        self.img_pub = self.create_publisher(Image, self.image_pub_topic, 10)
+        if _TRAJ_VIZ_AVAILABLE:
+            self.create_subscription(
+                CameraInfo, self.camera_info_topic, self.cameraInfoCallback, 1)
 
         self.get_logger().info("iPlanner Ready.")
         
@@ -141,7 +160,7 @@ class iPlannerNode(Node):
     def config(self, args):
         self.main_freq   = args.main_freq
         self.model_save  = args.model_save
-        self.image_topic = args.depth_topic
+        self.depth_topic = args.depth_topic
         self.goal_topic  = args.goal_topic
         self.path_topic  = args.path_topic
         self.frame_id    = args.robot_id
@@ -156,6 +175,9 @@ class iPlannerNode(Node):
         self.ang_thred   = args.angular_thred
         self.track_dist  = args.track_dist
         self.joyGoal_scale = args.joyGoal_scale
+        self.camera_tilt = args.camera_tilt
+        self.image_pub_topic = args.image_topic   # viz output topic (not the depth input!)
+        self.camera_info_topic = args.camera_info_topic
         return 
 
     def timer_callback(self):
@@ -169,7 +191,7 @@ class iPlannerNode(Node):
             start = time.time()
 
             # Network Planning (Model inference)
-            self.preds, self.waypoints, fear_output, _ = self.iplanner_algo.plan(cur_image, self.goal_rb)
+            self.preds, self.waypoints, fear_output, img_process = self.iplanner_algo.plan(cur_image, self.goal_rb)
             end = time.time()
             self.timer_data.data = (end - start) * 1000
             self.timer_pub.publish(self.timer_data)
@@ -202,6 +224,11 @@ class iPlannerNode(Node):
                         self.planner_status.data = -1
                         self.status_pub.publish(self.planner_status)
             self.pubPath(self.waypoints, self.is_goal_init)
+            # Throttle viz rendering to ~2Hz to avoid GPU contention with model inference
+            self._viz_counter += 1
+            if self._viz_counter >= self._viz_interval:
+                self._viz_counter = 0
+                self.pubRenderImage(self.preds, self.waypoints, self.odom, self.goal_rb, self.fear, img_process)
 
     def pubPath(self, waypoints, is_goal_init=True):
         path = Path()
@@ -252,6 +279,56 @@ class iPlannerNode(Node):
         if phead is None or phead.dot(xhead) > 1.0 - self.ang_thred:
             return True
         return False
+
+    def cameraInfoCallback(self, msg: CameraInfo):
+        """Initialize TrajViz from the first CameraInfo message received.
+
+        Uses the camera intrinsic matrix (K, row-major 3x3 flattened to 9 values)
+        from the depth camera.  Called at most once; subscription is kept but
+        the body returns immediately after the first successful init.
+        """
+        if self.traj_viz is not None:
+            return
+        try:
+            tv = traj_viz_module.TrajViz(
+                map_name=None, cameraTilt=self.camera_tilt
+            )
+            # msg.k is a 9-element row-major K matrix: [fx,0,cx, 0,fy,cy, 0,0,1]
+            tv.set_camera_from_params(
+                fx=msg.k[0], fy=msg.k[4],
+                cx=msg.k[2], cy=msg.k[5],
+                width=msg.width, height=msg.height,
+            )
+            self.traj_viz = tv
+            self.get_logger().info(
+                f"TrajViz initialized: {msg.width}x{msg.height} "
+                f"fx={msg.k[0]:.1f} fy={msg.k[4]:.1f}"
+            )
+        except Exception as e:
+            self.get_logger().warn(f"TrajViz init failed: {e}")
+
+    def pubRenderImage(self, preds, waypoints, odom, goal, fear, image):
+        """Render planned trajectory onto depth image and publish to image_topic.
+
+        Skipped silently if TrajViz has not been initialized yet (waiting for
+        first CameraInfo) or if the robot odom is not yet available.
+        """
+        if self.traj_viz is None or odom is None:
+            return
+        try:
+            if torch.cuda.is_available():
+                odom = odom.cuda()
+                goal = goal.cuda()
+            cv_imgs = self.traj_viz.VizImages(
+                preds, waypoints, odom, goal, fear, image, is_shown=False
+            )
+            if cv_imgs:
+                ros_img = self.bridge.cv2_to_imgmsg(cv_imgs[0], encoding='bgr8')
+                ros_img.header.stamp = self.image_time.to_msg()
+                ros_img.header.frame_id = self.frame_id
+                self.img_pub.publish(ros_img)
+        except Exception as e:
+            self.get_logger().warn(f"pubRenderImage failed: {e}")
 
     def joyCallback(self, joy_msg):
         if joy_msg.buttons[4] > 0.9:
@@ -352,6 +429,19 @@ class iPlannerNode(Node):
             self.goal_rb = goal_robot_frame
         else:
             return
+        # Get robot pose from TF for image visualization
+        try:
+            odom_trans = self.tf_buffer.lookup_transform(
+                self.world_id, self.frame_id, rclpy.time.Time()
+            )
+            t = odom_trans.transform.translation
+            r = odom_trans.transform.rotation
+            self.odom = torch.tensor(
+                [[t.x, t.y, t.z, r.x, r.y, r.z, r.w]], dtype=torch.float32
+            )
+        except TransformException:
+            pass  # keep previous odom; visualization will use it next cycle
+
         self.ready_for_planning = True
         self.is_goal_processed  = True
         return

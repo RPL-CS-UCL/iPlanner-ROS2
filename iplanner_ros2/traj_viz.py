@@ -14,7 +14,7 @@ import torch
 import numpy as np
 import pypose as pp
 import open3d as o3d
-from tsdf_map import TSDF_Map
+from .tsdf_map import TSDF_Map
 from scipy.spatial.transform import Rotation as R
 import open3d.visualization.rendering as rendering
 from typing import List, Optional
@@ -24,19 +24,30 @@ IMAGE_HEIGHT = 360
 MESH_SIZE = 0.5
 
 class TrajViz:    
-    def __init__(self, root_path: str, map_name: str = "tsdf1", cameraTilt: float = 0.0, robot_name: str = "robot"):
+    def __init__(self, root_path: str = '', map_name: Optional[str] = "tsdf1", cameraTilt: float = 0.0, robot_name: str = "robot"):
         """
         Initialize TrajViz class.
+
+        When both root_path and map_name are provided the TSDF cost-map is loaded
+        and camera intrinsics are read from disk.  When map_name is None and
+        root_path is non-empty the intrinsic file is still read from disk.
+        When root_path is empty (default) no file I/O is performed; call
+        set_camera_from_params() before using VizImages.
         """
         self.is_map = False
+        self.camera = None
+        self._renderer = None
+        self._renderer_size = (0, 0)
         if map_name:
             self.tsdf_map = TSDF_Map()
             self.tsdf_map.ReadTSDFMap(root_path, map_name)
             self.is_map = True
             intrinsic_path = os.path.join(root_path, "depth_intrinsic.txt")
-        else:
+            self.SetCamera(intrinsic_path)
+        elif root_path:
             intrinsic_path = os.path.join(root_path, robot_name + "_intrinsic.txt")
-        self.SetCamera(intrinsic_path)
+            self.SetCamera(intrinsic_path)
+        # else: camera will be set later via set_camera_from_params()
         self.camera_tilt = cameraTilt
 
     def TransformPoints(self, odom: torch.Tensor, points: torch.Tensor) -> pp.SE3:
@@ -58,6 +69,16 @@ class TrajViz:
             elems = np.fromstring(lines[0][1:-2], dtype=float, sep=', ')
         K = np.array(elems).reshape(-1, 4)
         self.camera = o3d.camera.PinholeCameraIntrinsic(img_width, img_height, K[0,0], K[1,1], K[0,2], K[1,2])
+
+    def set_camera_from_params(self, fx: float, fy: float, cx: float, cy: float,
+                                width: int, height: int) -> None:
+        """Set camera intrinsics directly from scalar parameters.
+
+        Use this as an alternative to SetCamera() when intrinsics are already
+        known (e.g. from a ROS CameraInfo message) and no file is available.
+        """
+        self.camera = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
+        self._renderer = None  # reset cached renderer when intrinsics change
 
     def VizTrajectory(self, preds: torch.Tensor, waypoints: torch.Tensor, odom: torch.Tensor, goal: torch.Tensor, fear: torch.Tensor, cost_map: bool = True, visual_height: float = 0.5, mesh_size: float = MESH_SIZE) -> None:
         """
@@ -198,8 +219,12 @@ class TrajViz:
         mesh_sphere_fear.paint_uniform_color([1.0, 0.64, 0.0])
         mesh_box.paint_uniform_color([1.0, 0.64, 0.1])
 
-        # Init open3D render
-        render = rendering.OffscreenRenderer(self.camera.width, self.camera.height)
+        # Reuse cached renderer (avoid creating FEngine every frame)
+        if self._renderer is None or self._renderer_size != (self.camera.width, self.camera.height):
+            self._renderer = rendering.OffscreenRenderer(self.camera.width, self.camera.height)
+            self._renderer_size = (self.camera.width, self.camera.height)
+        render = self._renderer
+        render.scene.clear_geometry()
         render.scene.set_background([0.0, 0.0, 0.0, 1.0])  # RGBA
         render.scene.scene.enable_sun_light(False)
 
@@ -247,7 +272,7 @@ class TrajViz:
             c_img = c_img.cpu().detach().numpy().transpose(1, 2, 0)
             c_img = (c_img * 255 / np.max(c_img)).astype('uint8')
             img_o3d[mask, :] = c_img[mask, :]
-            img_cv2 = cv2.cvtColor(img_o3d, cv2.COLOR_RGBA2BGRA)
+            img_cv2 = cv2.cvtColor(img_o3d, cv2.COLOR_RGB2BGR)
             cv_img_list.append(img_cv2)
 
             # Visualize image
